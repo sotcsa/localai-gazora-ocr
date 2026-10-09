@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Gázóra leolvasás lokálisan, Ollamával, ugyanazzal a prompttal, mint az Apps Scriptben.
 # Használat:  ./ollama_teszt.sh kep.jpg [modell]
-# Előtte:     ollama pull qwen3-vl:2b
+# Előtte:     ollama pull qwen3-vl:2b-instruct
+# Az "-instruct" változat kell: a sima qwen3-vl:2b gondolkodó (thinking) változat, ami
+# a think:false ellenére is sokáig gondolkodik, és nem marad helye a válasznak.
 # Kell hozzá: curl, jq, base64 (macOS-en a kicsinyítéshez a beépített sips)
 #
 # A lépések naplója a stderr-re megy ([HH:MM:SS] előtaggal), az eredmény JSON a stdout-ra.
@@ -9,7 +11,7 @@
 set -euo pipefail
 
 IMG="${1:?Használat: $0 kep.jpg [modell]}"
-MODEL="${2:-qwen3-vl:2b}"
+MODEL="${2:-qwen3-vl:2b-instruct}"
 HOST="${OLLAMA_HOST_URL:-http://localhost:11434}"
 NUM_CTX="${NUM_CTX:-4096}"
 MAX_PX="${MAX_PX:-1280}"
@@ -72,7 +74,7 @@ base64 < "$IMG" | tr -d '\n' > "$TMP"
 jq -n --arg model "$MODEL" --arg prompt "$PROMPT" --rawfile img "$TMP" --argjson schema "$SCHEMA" \
   --argjson ctx "$NUM_CTX" \
   '{model: $model, prompt: $prompt, images: [$img], format: $schema, stream: false, think: false,
-    options: {temperature: 0, num_ctx: $ctx}}' > "$REQ"
+    options: {temperature: 0, num_ctx: $ctx, num_predict: 300}}' > "$REQ"
 log "Kérés mérete: $(size "$REQ"). Küldés... (az első futásnál a modell betöltése is eltarthat egy ideig)"
 
 # 5. Hívás
@@ -90,11 +92,16 @@ THINK=$(jq -r '.thinking // empty' "$RAW_OUT")
 RESP=$(jq -r '.response // empty' "$RAW_OUT")
 if [ -z "$RESP" ]; then
   log "A 'response' mező üres."
-  [ "$(jq -r '.done_reason' "$RAW_OUT")" = "length" ] && log "A kontextus/kimenet betelt: próbáld NUM_CTX=8192 ./ollama_teszt.sh ..."
+  if [ "$(jq -r '.done_reason' "$RAW_OUT")" = "length" ]; then
+    if [ -n "$THINK" ]; then
+      log "A modell gondolkodással töltötte ki a keretet. Használj -instruct változatot, pl.: ollama pull qwen3-vl:2b-instruct"
+    else
+      log "A kontextus/kimenet betelt: próbáld NUM_CTX=8192 ./ollama_teszt.sh ..."
+    fi
+  fi
   exit 1
 fi
 log "Nyers válasz: $RESP"
 
 # 7. Eredmény
 echo "$RESP" | jq . || { log "A válasz nem érvényes JSON"; exit 1; }
-
