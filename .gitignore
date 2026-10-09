@@ -3,3 +3,5 @@ kicsi.jpg.b64
 ollama_*.json
 prompt.txt
 req.json
+eredmenyek/
+.DS_Store

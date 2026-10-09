@@ -10,6 +10,11 @@ ollama pull qwen3.5:4b
 ./run_all.sh mappa/              # minden .jpg/.jpeg/.png egy mappában
 ```
 
+A `run_all.sh` képenként menti az eredményt és a naplót az `eredmenyek/` könyvtárba
+(`<kép>.json`, `<kép>.log`; másik hely: `OUT_DIR=...`). A végén táblázatot ír ki a kép nevével,
+az óraállással, a bizonyossággal, a futásidővel és a státusszal, és ezt az
+`eredmenyek/osszesito.csv` fájlba is elmenti (pontosvesszővel tagolva, Excelben megnyitható).
+
 Kell hozzá: `curl`, `jq`, `base64`. Kicsinyítéshez és a nagyításhoz macOS-en a beépített `sips`.
 A napló a stderr-re megy (`[HH:MM:SS]` előtaggal), az eredmény JSON a stdout-ra:
 
