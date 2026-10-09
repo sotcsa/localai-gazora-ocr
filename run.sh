@@ -322,7 +322,7 @@ if [ "$FINAL_VALID" = true ] && { [ "$ROLLING_SEEN" = true ] || [ "$USED_RETRY_M
    && [ -n "$ZOOM_MODEL" ] && command -v sips >/dev/null \
    && echo "$FINAL_RESP" | jq -e '.is_gas_meter == true' >/dev/null; then
   if [ "$ROLLING_SEEN" = true ]; then
-    log "Az utolsó dob két számjegy között áll, nagyítás a(z) $ZOOM_MODEL modellel..."
+    log "A modell szerint az utolsó dob két számjegy között állhat, ellenőrzés nagyítással ($ZOOM_MODEL)..."
   else
     log "Nehéz kép (erősebb modell kellett), az utolsó dob ellenőrzése nagyítással ($ZOOM_MODEL)..."
   fi
