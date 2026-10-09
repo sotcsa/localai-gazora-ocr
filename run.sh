@@ -16,6 +16,10 @@
 #   RETRY_MODEL   - (alapértelmezett: qwen3.5:4b; üresre állítva kikapcsol) ha meg van adva és eltér a MODEL-től, az utolsó próbálkozás ezzel (jellemzően
 #                   egy erősebb) modellel megy, a korábbiak a sima MODEL-lel
 #   MAX_INT_DIGITS- az integer_part legfeljebb ennyi számjegyből állhat (alapértelmezett: 5)
+#   ZOOM_MODEL    - (alapértelmezett: qwen3.5:4b; üresre állítva kikapcsol) ha az utolsó dob két
+#                   számjegy között áll, ez a modell megkeresi a tizedes mezőt, a script kivágja
+#                   az eredeti képből, és a nagyított kivágáson újra megkérdezi az utolsó dobot.
+#                   Csak macOS-en (sips) és csak ebben a sarokesetben fut.
 # A validáció szabálya: ha is_gas_meter=true, a decimal_part pontosan 3 számjegy kell legyen,
 # az integer_part pedig 1..MAX_INT_DIGITS számjegy - egyébként új próbálkozás indul.
 set -euo pipefail
@@ -29,6 +33,7 @@ RAW_OUT="ollama_valasz.json"
 MAX_RETRIES="${MAX_RETRIES:-2}"
 RETRY_MODEL="${RETRY_MODEL-qwen3.5:4b}"
 MAX_INT_DIGITS="${MAX_INT_DIGITS:-5}"
+ZOOM_MODEL="${ZOOM_MODEL-qwen3.5:4b}"
 
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 die() { log "HIBA: $*"; exit 1; }
@@ -39,6 +44,7 @@ Read the counter value.
 - integer_part: the digits before the decimal point, usually on a black/dark background (typically 5 digits). Keep leading zeros.
 - decimal_part: the digits after the decimal point, usually on a red background or after a comma (typically 3 digits). Empty string if not visible.
 - If a drum is halfway between two digits, use the smaller digit (the one rolling out), except 9→0 where you use 9.
+- last_drum_rolling: true if the rightmost drum is between two digits (parts of two different digits visible in its window), otherwise false.
 - last_drum_upper / last_drum_lower: look only at the rightmost drum (last digit of decimal_part). Give the digit (or partial digit) visible in the upper half and in the lower half of its window. If one digit is centered, give that same digit in both.
 - Ignore serial numbers, year of manufacture, Qmax and other printed labels.
 - confidence: 0..1, how sure you are that every digit is correct.
@@ -51,6 +57,7 @@ SCHEMA='{
     "is_gas_meter": {"type": "boolean"},
     "integer_part": {"type": "string"},
     "decimal_part": {"type": "string"},
+    "last_drum_rolling": {"type": "boolean"},
     "last_drum_upper": {"type": "string"},
     "last_drum_lower": {"type": "string"},
     "confidence":   {"type": "number"},
@@ -78,9 +85,15 @@ if [ -n "$RETRY_MODEL" ] && [ "$RETRY_MODEL" != "$MODEL" ]; then
   check_model "$RETRY_MODEL"
   log "Erősebb (retry) modell megvan: $RETRY_MODEL"
 fi
+if [ -n "$ZOOM_MODEL" ]; then
+  check_model "$ZOOM_MODEL"
+  log "Nagyító (zoom) modell megvan: $ZOOM_MODEL"
+fi
 
 # 3. Kicsinyítés
-TMP=$(mktemp); SMALL="$(mktemp).jpg"; trap 'rm -f "$TMP" "$SMALL"' EXIT
+ORIG_IMG="$IMG"
+TMP=$(mktemp); SMALL="$(mktemp).jpg"; CROP="$(mktemp).jpg"; CROP_B64=$(mktemp)
+trap 'rm -f "$TMP" "$SMALL" "$CROP" "$CROP_B64"' EXIT
 if command -v sips >/dev/null; then
   sips -Z "$MAX_PX" -s format jpeg "$IMG" --out "$SMALL" >/dev/null
   DIM=$(sips -g pixelWidth -g pixelHeight "$SMALL" | awk '/pixel/{print $2}' | paste -sd x -)
@@ -193,6 +206,60 @@ apply_last_drum_logic() {
   echo "$resp" | jq -c --arg d "${dec%?}$digit" '.decimal_part = $d'
 }
 
+# 5c. Nagyítás az utolsó dobra (csak sarokesetben, lásd ZOOM_MODEL).
+# Egy egyszerű JSON-kérés a ZOOM_MODEL-nek; a 'response' mezőt adja vissza (üres, ha hibás).
+ask_json() {
+  local prompt="$1" img_b64="$2" schema="$3" out_file="$4" req_file http
+  req_file=$(mktemp)
+  jq -n --arg model "$ZOOM_MODEL" --arg prompt "$prompt" --rawfile img "$img_b64" --argjson schema "$schema" \
+    --argjson ctx "$NUM_CTX" \
+    '{model: $model, prompt: $prompt, images: [$img], format: $schema, stream: false, think: false,
+      options: {temperature: 0, num_ctx: $ctx, num_predict: 100}}' > "$req_file"
+  http=$(curl -s -o "$out_file" -w '%{http_code}' "$HOST/api/generate" -d @"$req_file") || http=000
+  rm -f "$req_file"
+  [ "$http" = "200" ] && jq -r '.response // empty' "$out_file"
+}
+
+# 1) a ZOOM_MODEL megadja a piros tizedes mező helyét (0-1000 relatív koordináták),
+# 2) a script kivágja az eredeti felbontású képből (15% ráhagyással) és nagyítja,
+# 3) a kivágáson megkérdezi, mi látszik az utolsó dob ablakának felső és alsó felében.
+# Az eredményt a last_drum_upper/lower mezőkbe írja; a döntést utána az apply_last_drum_logic hozza.
+# Bármilyen hiba esetén az eredeti választ adja vissza.
+zoom_last_drum() {
+  local resp="$1" bbox x1 y1 x2 y2 W H px py cx cy cw ch drum up lo
+  local t0; t0=$(date +%s)
+  bbox=$(ask_json 'Locate the red-framed area with the decimal digits of the gas meter counter (after the comma, left of m³). Return its bounding box as bbox_2d [x1, y1, x2, y2] in relative coordinates 0-1000.' \
+    "$TMP" '{"type":"object","properties":{"bbox_2d":{"type":"array","items":{"type":"integer"}}},"required":["bbox_2d"]}' \
+    "${RAW_OUT%.json}.zoom_bbox.json" | jq -r '.bbox_2d | select(length == 4) | map(tostring) | join(" ")' 2>/dev/null || true)
+  read -r x1 y1 x2 y2 <<< "$bbox"
+  if ! [[ "$x1" =~ ^[0-9]+$ && "$y1" =~ ^[0-9]+$ && "$x2" =~ ^[0-9]+$ && "$y2" =~ ^[0-9]+$ ]] \
+     || [ "$x2" -le "$x1" ] || [ "$y2" -le "$y1" ] || [ "$x2" -gt 1000 ] || [ "$y2" -gt 1000 ]; then
+    log "Nagyítás: nem kaptam használható helyet a tizedes mezőre ('$bbox'), kihagyom"
+    echo "$resp"; return
+  fi
+  W=$(sips -g pixelWidth "$ORIG_IMG" | awk '/pixelWidth/{print $2}')
+  H=$(sips -g pixelHeight "$ORIG_IMG" | awk '/pixelHeight/{print $2}')
+  px=$(( (x2 - x1) * 15 / 100 )); py=$(( (y2 - y1) * 15 / 100 ))
+  x1=$(( x1 - px < 0 ? 0 : x1 - px )); y1=$(( y1 - py < 0 ? 0 : y1 - py ))
+  x2=$(( x2 + px > 1000 ? 1000 : x2 + px )); y2=$(( y2 + py > 1000 ? 1000 : y2 + py ))
+  cx=$(( x1 * W / 1000 )); cy=$(( y1 * H / 1000 )); cw=$(( (x2 - x1) * W / 1000 )); ch=$(( (y2 - y1) * H / 1000 ))
+  sips -s format jpeg -c "$ch" "$cw" --cropOffset "$cy" "$cx" "$ORIG_IMG" --out "$CROP" >/dev/null
+  sips -Z 1024 "$CROP" >/dev/null
+  base64 < "$CROP" | tr -d '\n' > "$CROP_B64"
+  log "Nagyítás: tizedes mező [$x1,$y1,$x2,$y2], kivágás ${cw}x${ch} px az eredetiből"
+
+  drum=$(ask_json 'Close-up of the decimal digits of a gas meter drum counter. Look ONLY at the rightmost drum (the last digit, with tick marks). It may be rolling between two digits: then the bottom part of one digit is visible in the upper half of the window and the top part of the next digit in the lower half. upper: the digit (or partial digit) in the upper half of the rightmost window. lower: the digit (or partial digit) in the lower half. If one digit is centered, give it in both.' \
+    "$CROP_B64" '{"type":"object","properties":{"upper":{"type":"string"},"lower":{"type":"string"}},"required":["upper","lower"]}' \
+    "${RAW_OUT%.json}.zoom_drum.json" || true)
+  up=$(echo "$drum" | jq -r '.upper // ""' 2>/dev/null || true)
+  lo=$(echo "$drum" | jq -r '.lower // ""' 2>/dev/null || true)
+  log "Nagyítás ($(( $(date +%s) - t0 )) mp): utolsó dob fent '$up', lent '$lo'"
+  if ! [[ "$up" =~ ^[0-9]$ && "$lo" =~ ^[0-9]$ ]]; then
+    echo "$resp"; return
+  fi
+  echo "$resp" | jq -c --arg u "$up" --arg l "$lo" '.last_drum_upper = $u | .last_drum_lower = $l'
+}
+
 # 6. Próbálkozási sorozat összeállítása: MAX_RETRIES próbálkozás a MODEL-lel,
 # az utolsó helyett RETRY_MODEL-lel, ha az meg van adva, eltér a MODEL-től, és van
 # egynél több próbálkozás (különben az első és egyetlen próbálkozás is RETRY_MODEL-re
@@ -204,6 +271,8 @@ if [ -n "$RETRY_MODEL" ] && [ "$RETRY_MODEL" != "$MODEL" ] && [ "$MAX_RETRIES" -
 fi
 
 FINAL_RESP=""
+FINAL_VALID=false
+ROLLING_SEEN=false
 FEEDBACK=""
 for idx in "${!ATTEMPT_MODELS[@]}"; do
   M="${ATTEMPT_MODELS[$idx]}"
@@ -216,9 +285,15 @@ for idx in "${!ATTEMPT_MODELS[@]}"; do
   if ! run_attempt "$M" "$ATTEMPT_OUT" "$FEEDBACK"; then
     continue
   fi
+  # A forgást bármelyik (akár érvénytelen) próbálkozás jelezheti: a modellek ebben nem egységesek.
+  if echo "$ATTEMPT_RESP" | jq -e '.last_drum_rolling == true or
+       ((.last_drum_upper // "") != (.last_drum_lower // ""))' >/dev/null; then
+    ROLLING_SEEN=true
+  fi
   ATTEMPT_RESP=$(apply_last_drum_logic "$ATTEMPT_RESP")
   FINAL_RESP="$ATTEMPT_RESP"
   if validate_response "$ATTEMPT_RESP"; then
+    FINAL_VALID=true
     break
   fi
   log "Validáció sikertelen: $VALIDATION_REASON"
@@ -226,6 +301,15 @@ for idx in "${!ATTEMPT_MODELS[@]}"; do
 done
 
 [ -n "$FINAL_RESP" ] || die "minden próbálkozás sikertelen volt (üres vagy érvénytelen válasz)"
+
+# 6b. Sarokeset: az utolsó dob két számjegy között áll -> nagyított második ránézés.
+# Csak érvényes gázóra-olvasatnál, ha valamelyik próbálkozás jelezte a forgást, vagy fent/lent
+# eltérő jegyet látott.
+if [ "$FINAL_VALID" = true ] && [ "$ROLLING_SEEN" = true ] && [ -n "$ZOOM_MODEL" ] && command -v sips >/dev/null \
+   && echo "$FINAL_RESP" | jq -e '.is_gas_meter == true' >/dev/null; then
+  log "Az utolsó dob két számjegy között áll, nagyítás a(z) $ZOOM_MODEL modellel..."
+  FINAL_RESP=$(apply_last_drum_logic "$(zoom_last_drum "$FINAL_RESP")")
+fi
 
 # 7. Eredmény
 echo "$FINAL_RESP" | jq . || { log "A válasz nem érvényes JSON"; exit 1; }
