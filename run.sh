@@ -2,6 +2,7 @@
 # Gázóra leolvasás lokálisan, Ollamával, ugyanazzal a prompttal, mint az Apps Scriptben.
 # Használat:  ./ollama_teszt.sh kep.jpg [modell]
 # Előtte:     ollama pull qwen3-vl:2b
+# num_ctx: 4096 – az alapértelmezett nagy kontextus (pl. 65536) több GB extra memóriát foglal.
 # Kell hozzá: curl, jq, base64
 set -euo pipefail
 
@@ -31,11 +32,17 @@ SCHEMA='{
 }'
 
 # A képet fájlon keresztül adjuk át (nagy fotónál a parancssori argumentum túl hosszú lenne).
-TMP=$(mktemp); trap 'rm -f "$TMP"' EXIT
+TMP=$(mktemp); SMALL="$(mktemp).jpg"; trap 'rm -f "$TMP" "$SMALL"' EXIT
+
+# Kicsinyítés max. 1280 px-re: a teljes felbontású telefonfotó több ezer képtokent és sok memóriát eszik.
+if command -v sips >/dev/null; then          # macOS beépített eszköz
+  sips -Z 1280 -s format jpeg "$IMG" --out "$SMALL" >/dev/null
+  IMG="$SMALL"
+fi
 base64 < "$IMG" | tr -d '\n' > "$TMP"
 
 jq -n --arg model "$MODEL" --arg prompt "$PROMPT" --rawfile img "$TMP" --argjson schema "$SCHEMA" \
-  '{model: $model, prompt: $prompt, images: [$img], format: $schema, stream: false, options: {temperature: 0}}' \
+  '{model: $model, prompt: $prompt, images: [$img], format: $schema, stream: false, options: {temperature: 0, num_ctx: 4096}}' \
 | curl -s http://localhost:11434/api/generate -d @- \
 | jq -r '.response' | jq .
 
