@@ -1,9 +1,5 @@
-IMG_20250522_093934.jpg
-kicsi.jpg
+*.jpg
 kicsi.jpg.b64
-ollama_valasz.json
-ollama_valasz.retry*.json
+ollama_*.json
 prompt.txt
 req.json
-IMG_20241202_131143_hard.jpg
-ollama_valasz.zoom_*.json
