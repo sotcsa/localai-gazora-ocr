@@ -15,13 +15,14 @@
 #                   (alapértelmezett: 2, azaz 1 újrapróbálkozás)
 #   RETRY_MODEL   - (alapértelmezett: qwen3.5:4b; üresre állítva kikapcsol) ha meg van adva és eltér a MODEL-től, az utolsó próbálkozás ezzel (jellemzően
 #                   egy erősebb) modellel megy, a korábbiak a sima MODEL-lel
-#   MAX_INT_DIGITS- az integer_part legfeljebb ennyi számjegyből állhat (alapértelmezett: 5)
+#   INT_DIGITS    - az integer_part pontosan ennyi számjegy (alapértelmezett: 5, a gázórák fekete
+#                   dobjainak száma). Ha egy jegy kimarad (pl. megcsillan), új próbálkozás indul.
 #   ZOOM_MODEL    - (alapértelmezett: qwen3.5:4b; üresre állítva kikapcsol) ha az utolsó dob két
 #                   számjegy között áll, ez a modell megkeresi a tizedes mezőt, a script kivágja
 #                   az eredeti képből, és a nagyított kivágáson újra megkérdezi az utolsó dobot.
 #                   Csak macOS-en (sips) és csak ebben a sarokesetben fut.
 # A validáció szabálya: ha is_gas_meter=true, a decimal_part pontosan 3 számjegy kell legyen,
-# az integer_part pedig 1..MAX_INT_DIGITS számjegy - egyébként új próbálkozás indul.
+# az integer_part pedig pontosan INT_DIGITS számjegy - egyébként új próbálkozás indul.
 set -euo pipefail
 
 IMG="${1:?Használat: $0 kep.jpg [modell]}"
@@ -32,7 +33,7 @@ MAX_PX="${MAX_PX:-1280}"
 RAW_OUT="ollama_valasz.json"
 MAX_RETRIES="${MAX_RETRIES:-2}"
 RETRY_MODEL="${RETRY_MODEL-qwen3.5:4b}"
-MAX_INT_DIGITS="${MAX_INT_DIGITS:-5}"
+INT_DIGITS="${INT_DIGITS:-5}"
 ZOOM_MODEL="${ZOOM_MODEL-qwen3.5:4b}"
 
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
@@ -153,7 +154,7 @@ run_attempt() {
   ATTEMPT_RESP="$resp"
 }
 
-# 5. Validáció: 3 pontos decimal_part és ésszerű hosszúságú integer_part.
+# 5. Validáció: 3 jegyű decimal_part és INT_DIGITS jegyű integer_part.
 # Ha a számláló nem is gázóra (is_gas_meter=false), nincs mit validálni.
 # Hiba esetén a VALIDATION_REASON-be teszi az okot és 1-gyel tér vissza.
 validate_response() {
@@ -164,9 +165,9 @@ validate_response() {
   fi
   int_part=$(echo "$resp" | jq -r '.integer_part // ""')
   dec_part=$(echo "$resp" | jq -r '.decimal_part // ""')
-  if ! [[ "$int_part" =~ ^[0-9]{1,${MAX_INT_DIGITS}}$ ]]; then
-    VALIDATION_REASON="integer_part hibás vagy túl nagy: '$int_part' (legfeljebb $MAX_INT_DIGITS számjegy várt)"
-    VALIDATION_HINT="integer_part '$int_part' is invalid: it must be 1 to $MAX_INT_DIGITS digits, only the digits before the decimal point."
+  if ! [[ "$int_part" =~ ^[0-9]{${INT_DIGITS}}$ ]]; then
+    VALIDATION_REASON="integer_part nem pontosan $INT_DIGITS számjegy: '$int_part'"
+    VALIDATION_HINT="integer_part '$int_part' is invalid: it must be exactly $INT_DIGITS digits (one per black drum before the comma, keep leading zeros). A digit may be partly hidden by glare or reflection: still read it."
     return 1
   fi
   if ! [[ "$dec_part" =~ ^[0-9]{3}$ ]]; then
@@ -226,7 +227,7 @@ ask_json() {
 # Az eredményt a last_drum_upper/lower mezőkbe írja; a döntést utána az apply_last_drum_logic hozza.
 # Bármilyen hiba esetén az eredeti választ adja vissza.
 zoom_last_drum() {
-  local resp="$1" bbox x1 y1 x2 y2 W H px py cx cy cw ch drum up lo
+  local resp="$1" bbox x1 y1 x2 y2 W H px py cx cy cw ch drum up lo dec want
   local t0; t0=$(date +%s)
   bbox=$(ask_json 'Locate the red-framed area with the decimal digits of the gas meter counter (after the comma, left of m³). Return its bounding box as bbox_2d [x1, y1, x2, y2] in relative coordinates 0-1000.' \
     "$TMP" '{"type":"object","properties":{"bbox_2d":{"type":"array","items":{"type":"integer"}}},"required":["bbox_2d"]}' \
@@ -248,16 +249,25 @@ zoom_last_drum() {
   base64 < "$CROP" | tr -d '\n' > "$CROP_B64"
   log "Nagyítás: tizedes mező [$x1,$y1,$x2,$y2], kivágás ${cw}x${ch} px az eredetiből"
 
-  drum=$(ask_json 'Close-up of the decimal digits of a gas meter drum counter. Look ONLY at the rightmost drum (the last digit, with tick marks). It may be rolling between two digits: then the bottom part of one digit is visible in the upper half of the window and the top part of the next digit in the lower half. upper: the digit (or partial digit) in the upper half of the rightmost window. lower: the digit (or partial digit) in the lower half. If one digit is centered, give it in both.' \
-    "$CROP_B64" '{"type":"object","properties":{"upper":{"type":"string"},"lower":{"type":"string"}},"required":["upper","lower"]}' \
+  drum=$(ask_json 'Close-up of the decimal digits of a gas meter drum counter. Look ONLY at the rightmost drum (the last digit, with tick marks). It may be rolling between two digits: then the bottom part of one digit is visible in the upper half of the window and the top part of the next digit in the lower half. upper: the digit (or partial digit) in the upper half of the rightmost window. lower: the digit (or partial digit) in the lower half. If one digit is centered, give it in both. decimals: all digits in the red-framed area, left to right (empty if there is no red-framed area in the image).' \
+    "$CROP_B64" '{"type":"object","properties":{"decimals":{"type":"string"},"upper":{"type":"string"},"lower":{"type":"string"}},"required":["decimals","upper","lower"]}' \
     "${RAW_OUT%.json}.zoom_drum.json" || true)
   up=$(echo "$drum" | jq -r '.upper // ""' 2>/dev/null || true)
   lo=$(echo "$drum" | jq -r '.lower // ""' 2>/dev/null || true)
-  log "Nagyítás ($(( $(date +%s) - t0 )) mp): utolsó dob fent '$up', lent '$lo'"
+  dec=$(echo "$drum" | jq -r '.decimals // ""' 2>/dev/null | tr -cd '0-9' || true)
+  log "Nagyítás ($(( $(date +%s) - t0 )) mp): tizedes jegyek '$dec', utolsó dob fent '$up', lent '$lo'"
+  # Ellenőrzés: ha a bbox rossz helyre mutatott, a kivágáson nem a tizedes mező van. Az első két
+  # tizedes jegynek egyeznie kell a fő olvasattal, különben a nagyítás eredményét eldobjuk.
+  want=$(echo "$resp" | jq -r '.decimal_part // ""' | cut -c1-2)
+  if [ "${dec:0:2}" != "$want" ]; then
+    log "Nagyítás: a kivágáson a tizedes jegyek ('$dec') nem egyeznek a leolvasással ('$want'), eldobom"
+    echo "$resp"; return
+  fi
   if ! [[ "$up" =~ ^[0-9]$ && "$lo" =~ ^[0-9]$ ]]; then
     echo "$resp"; return
   fi
-  echo "$resp" | jq -c --arg u "$up" --arg l "$lo" '.last_drum_upper = $u | .last_drum_lower = $l'
+  echo "$resp" | jq -c --arg u "$up" --arg l "$lo" \
+    '.last_drum_upper = $u | .last_drum_lower = $l | .last_drum_rolling = ($u != $l)'
 }
 
 # 6. Próbálkozási sorozat összeállítása: MAX_RETRIES próbálkozás a MODEL-lel,
@@ -273,6 +283,7 @@ fi
 FINAL_RESP=""
 FINAL_VALID=false
 ROLLING_SEEN=false
+USED_RETRY_MODEL=false
 FEEDBACK=""
 for idx in "${!ATTEMPT_MODELS[@]}"; do
   M="${ATTEMPT_MODELS[$idx]}"
@@ -282,6 +293,7 @@ for idx in "${!ATTEMPT_MODELS[@]}"; do
   # Az előző válaszra vonatkozó visszajelzés csak ugyanannak a modellnek megy: egy másik
   # (erősebb) modell különben a hibás előző olvasathoz igazodna, ahelyett hogy újraolvasná a képet.
   [ "$idx" -gt 0 ] && [ "$M" != "${ATTEMPT_MODELS[$idx-1]}" ] && FEEDBACK=""
+  [ "$M" != "$MODEL" ] && USED_RETRY_MODEL=true
   if ! run_attempt "$M" "$ATTEMPT_OUT" "$FEEDBACK"; then
     continue
   fi
@@ -304,10 +316,16 @@ done
 
 # 6b. Sarokeset: az utolsó dob két számjegy között áll -> nagyított második ránézés.
 # Csak érvényes gázóra-olvasatnál, ha valamelyik próbálkozás jelezte a forgást, vagy fent/lent
-# eltérő jegyet látott.
-if [ "$FINAL_VALID" = true ] && [ "$ROLLING_SEEN" = true ] && [ -n "$ZOOM_MODEL" ] && command -v sips >/dev/null \
+# eltérő jegyet látott, vagy az erősebb modellre kellett váltani (nehéz kép; a qwen3.5:4b a
+# forgást magától nem jelzi).
+if [ "$FINAL_VALID" = true ] && { [ "$ROLLING_SEEN" = true ] || [ "$USED_RETRY_MODEL" = true ]; } \
+   && [ -n "$ZOOM_MODEL" ] && command -v sips >/dev/null \
    && echo "$FINAL_RESP" | jq -e '.is_gas_meter == true' >/dev/null; then
-  log "Az utolsó dob két számjegy között áll, nagyítás a(z) $ZOOM_MODEL modellel..."
+  if [ "$ROLLING_SEEN" = true ]; then
+    log "Az utolsó dob két számjegy között áll, nagyítás a(z) $ZOOM_MODEL modellel..."
+  else
+    log "Nehéz kép (erősebb modell kellett), az utolsó dob ellenőrzése nagyítással ($ZOOM_MODEL)..."
+  fi
   FINAL_RESP=$(apply_last_drum_logic "$(zoom_last_drum "$FINAL_RESP")")
 fi
 
