@@ -12,8 +12,10 @@
 #
 # Validáció és újrafinomítás (env változókkal hangolható):
 #   MAX_RETRIES   - hány próbálkozás engedett összesen, ha a válasz nem áll meg a validáción
-#                   (alapértelmezett: 2, azaz 1 újrapróbálkozás)
-#   RETRY_MODEL   - (alapértelmezett: qwen3.5:4b; üresre állítva kikapcsol) ha meg van adva és eltér a MODEL-től, az utolsó próbálkozás ezzel (jellemzően
+#                   (alapértelmezett: 1, azaz nincs újrapróbálkozás: egy modell van, ugyanaz a válasz jönne)
+#   KEEP_ALIVE    - meddig maradjon a modell a memóriában (alapértelmezett: 30m)
+#   ZOOM_ALWAYS   - true: érvényes olvasatnál mindig fut a nagyítás (alapértelmezett), false: csak sarokesetben
+#   RETRY_MODEL   - (alapértelmezett: üres = kikapcsolva) ha meg van adva és eltér a MODEL-től, az utolsó próbálkozás ezzel (jellemzően
 #                   egy erősebb) modellel megy, a korábbiak a sima MODEL-lel
 #   INT_DIGITS    - az integer_part pontosan ennyi számjegy (alapértelmezett: 5, a gázórák fekete
 #                   dobjainak száma). Ha egy jegy kimarad (pl. megcsillan), új próbálkozás indul.
@@ -26,13 +28,15 @@
 set -euo pipefail
 
 IMG="${1:?Használat: $0 kep.jpg [modell]}"
-MODEL="${2:-qwen3-vl:2b-instruct}"
+MODEL="${2:-qwen3.5:4b}"
 HOST="${OLLAMA_HOST_URL:-http://localhost:11434}"
 NUM_CTX="${NUM_CTX:-4096}"
 MAX_PX="${MAX_PX:-1280}"
 RAW_OUT="ollama_valasz.json"
-MAX_RETRIES="${MAX_RETRIES:-2}"
-RETRY_MODEL="${RETRY_MODEL-qwen3.5:4b}"
+MAX_RETRIES="${MAX_RETRIES:-1}"
+RETRY_MODEL="${RETRY_MODEL-}"
+KEEP_ALIVE="${KEEP_ALIVE:-30m}"
+ZOOM_ALWAYS="${ZOOM_ALWAYS:-true}"
 INT_DIGITS="${INT_DIGITS:-5}"
 ZOOM_MODEL="${ZOOM_MODEL-qwen3.5:4b}"
 
@@ -86,7 +90,7 @@ if [ -n "$RETRY_MODEL" ] && [ "$RETRY_MODEL" != "$MODEL" ]; then
   check_model "$RETRY_MODEL"
   log "Erősebb (retry) modell megvan: $RETRY_MODEL"
 fi
-if [ -n "$ZOOM_MODEL" ]; then
+if [ -n "$ZOOM_MODEL" ] && [ "$ZOOM_MODEL" != "$MODEL" ]; then
   check_model "$ZOOM_MODEL"
   log "Nagyító (zoom) modell megvan: $ZOOM_MODEL"
 fi
@@ -117,8 +121,8 @@ run_attempt() {
   [ -n "$feedback" ] && prompt="$prompt"$'\n\n'"$feedback"
   req_file=$(mktemp)
   jq -n --arg model "$model" --arg prompt "$prompt" --rawfile img "$TMP" --argjson schema "$SCHEMA" \
-    --argjson ctx "$NUM_CTX" \
-    '{model: $model, prompt: $prompt, images: [$img], format: $schema, stream: false, think: false,
+    --argjson ctx "$NUM_CTX" --arg ka "$KEEP_ALIVE" \
+    '{model: $model, prompt: $prompt, images: [$img], format: $schema, stream: false, think: false, keep_alive: $ka,
       options: {temperature: 0, num_ctx: $ctx, num_predict: 300}}' > "$req_file"
   log "Kérés mérete: $(size "$req_file"), modell: $model. Küldés... (az első futásnál a modell betöltése is eltarthat egy ideig)"
 
@@ -213,8 +217,8 @@ ask_json() {
   local prompt="$1" img_b64="$2" schema="$3" out_file="$4" req_file http
   req_file=$(mktemp)
   jq -n --arg model "$ZOOM_MODEL" --arg prompt "$prompt" --rawfile img "$img_b64" --argjson schema "$schema" \
-    --argjson ctx "$NUM_CTX" \
-    '{model: $model, prompt: $prompt, images: [$img], format: $schema, stream: false, think: false,
+    --argjson ctx "$NUM_CTX" --arg ka "$KEEP_ALIVE" \
+    '{model: $model, prompt: $prompt, images: [$img], format: $schema, stream: false, think: false, keep_alive: $ka,
       options: {temperature: 0, num_ctx: $ctx, num_predict: 100}}' > "$req_file"
   http=$(curl -s -o "$out_file" -w '%{http_code}' "$HOST/api/generate" -d @"$req_file") || http=000
   rm -f "$req_file"
@@ -318,13 +322,15 @@ done
 # Csak érvényes gázóra-olvasatnál, ha valamelyik próbálkozás jelezte a forgást, vagy fent/lent
 # eltérő jegyet látott, vagy az erősebb modellre kellett váltani (nehéz kép; a qwen3.5:4b a
 # forgást magától nem jelzi).
-if [ "$FINAL_VALID" = true ] && { [ "$ROLLING_SEEN" = true ] || [ "$USED_RETRY_MODEL" = true ]; } \
+if [ "$FINAL_VALID" = true ] && { [ "$ROLLING_SEEN" = true ] || [ "$USED_RETRY_MODEL" = true ] || [ "$ZOOM_ALWAYS" = true ]; } \
    && [ -n "$ZOOM_MODEL" ] && command -v sips >/dev/null \
    && echo "$FINAL_RESP" | jq -e '.is_gas_meter == true' >/dev/null; then
   if [ "$ROLLING_SEEN" = true ]; then
     log "A modell szerint az utolsó dob két számjegy között állhat, ellenőrzés nagyítással ($ZOOM_MODEL)..."
-  else
+  elif [ "$USED_RETRY_MODEL" = true ]; then
     log "Nehéz kép (erősebb modell kellett), az utolsó dob ellenőrzése nagyítással ($ZOOM_MODEL)..."
+  else
+    log "Az utolsó dob ellenőrzése nagyítással ($ZOOM_MODEL, ZOOM_ALWAYS)..."
   fi
   FINAL_RESP=$(apply_last_drum_logic "$(zoom_last_drum "$FINAL_RESP")")
 fi

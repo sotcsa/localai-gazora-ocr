@@ -7,8 +7,8 @@
 #   OUT_DIR - az eredmények könyvtára (alapértelmezett: eredmenyek)
 set -euo pipefail
 
-DIR="${1:?Használat: $0 dir [modell]}"
-MODEL="${2:-qwen3-vl:2b-instruct}"
+DIR="${1:-$HOME/Downloads/drive-download-20261009T063617Z-1-001}"
+MODEL="${2:-qwen3.5:4b}"
 OUT_DIR="${OUT_DIR:-eredmenyek}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 mkdir -p "$OUT_DIR"

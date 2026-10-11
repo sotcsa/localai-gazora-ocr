@@ -4,7 +4,6 @@ Fényképről olvassa le egy háztartási gázóra mechanikus dobszámlálóját
 látó (vision) modellel. A prompt ugyanaz, mint az Apps Scriptes változatban.
 
 ```bash
-ollama pull qwen3-vl:2b-instruct
 ollama pull qwen3.5:4b
 ./run.sh kep.jpg                 # egy kép
 ./run_all.sh mappa/              # minden .jpg/.jpeg/.png egy mappában
@@ -33,6 +32,13 @@ A napló a stderr-re megy (`[HH:MM:SS]` előtaggal), az eredmény JSON a stdout-
 
 ## Hogyan működik
 
+> **Alapértelmezés (2026-10-11 óta): egyetlen modell.** Minden lépést a `qwen3.5:4b` végez, és
+> `KEEP_ALIVE` ideig (30 perc) a memóriában marad. Így az Ollama nem tölt be és nem cserélget két
+> modellt. Nincs újrapróbálkozás (`MAX_RETRIES=1`), a nagyítás minden érvényes olvasatnál lefut
+> (`ZOOM_ALWAYS=true`). Képenként kb. 15–20 mp, mindhárom tesztképen helyes az eredmény.
+> Az alábbi kétmodelles folyamat továbbra is elérhető:
+> `RETRY_MODEL=qwen3.5:4b MAX_RETRIES=2 ZOOM_ALWAYS=false ./run.sh kep.jpg qwen3-vl:2b-instruct`
+
 1. **Kicsinyítés** 1280 px-re (`MAX_PX`), base64.
 2. **Leolvasás** a gyors modellel (`qwen3-vl:2b-instruct`), JSON sémával kényszerített kimenettel.
 3. **Validáció**: `integer_part` pontosan 5 számjegy (`INT_DIGITS`), `decimal_part` pontosan 3 számjegy.
@@ -60,10 +66,12 @@ Nyers válaszok (gitignore-olva): `ollama_valasz.json`, `ollama_valasz.retryN.js
 
 | Változó | Alapérték | Jelentés |
 |---|---|---|
-| 2. paraméter | `qwen3-vl:2b-instruct` | első modell |
-| `RETRY_MODEL` | `qwen3.5:4b` | az utolsó próbálkozás modellje; üresre állítva kikapcsol |
+| 2. paraméter | `qwen3.5:4b` | a (fő) modell |
+| `RETRY_MODEL` | üres | az utolsó próbálkozás modellje; üresen kikapcsolva |
 | `ZOOM_MODEL` | `qwen3.5:4b` | a nagyítás modellje; üresre állítva kikapcsol |
-| `MAX_RETRIES` | `2` | próbálkozások száma összesen |
+| `MAX_RETRIES` | `1` | próbálkozások száma összesen |
+| `ZOOM_ALWAYS` | `true` | a nagyítás minden érvényes olvasatnál fut; `false`: csak sarokesetben |
+| `KEEP_ALIVE` | `30m` | meddig marad a modell a memóriában az utolsó kérés után |
 | `INT_DIGITS` | `5` | `integer_part` pontos hossza |
 | `MAX_PX` | `1280` | kicsinyítés hosszabb oldala |
 | `NUM_CTX` | `4096` | kontextusablak |
