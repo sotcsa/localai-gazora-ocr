@@ -10,9 +10,17 @@ ollama pull qwen3.5:4b
 ```
 
 A `run_all.sh` képenként menti az eredményt és a naplót az `eredmenyek/` könyvtárba
-(`<kép>.json`, `<kép>.log`; másik hely: `OUT_DIR=...`). A végén táblázatot ír ki a kép nevével,
-az óraállással, a bizonyossággal, a futásidővel és a státusszal, és ezt az
-`eredmenyek/osszesito.csv` fájlba is elmenti (pontosvesszővel tagolva, Excelben megnyitható).
+(`<kép>.json`, `<kép>.log`; másik hely: `OUT_DIR=...`). A végén táblázatot ír ki (kép, óraállás,
+bizonyosság, futásidő, státusz) és statisztikát (darabszámok, teljes idő, átlag, medián,
+leggyorsabb, leglassabb kép). Fájlok:
+
+- `osszesito.csv`: az aktuális futás sorai (minden futás felülírja);
+- `naplo.csv`: minden futás sorai egymás után fűzve, a futás időpontjával és a modellel;
+- `statisztika.txt`: az aktuális futás statisztikája.
+
+A CSV pontosvesszővel tagolt és tizedesvesszős (magyar Excel és magyar területi beállítású
+Google Táblázat számként olvassa). Oszlopok: `futas;kep;oraallas;m3;confidence;ido_mp;statusz;modell`
+(`oraallas` a vezető nullákkal, `m3` ugyanaz számként).
 
 Kell hozzá: `curl`, `jq`, `base64`. Kicsinyítéshez és a nagyításhoz macOS-en a beépített `sips`.
 A napló a stderr-re megy (`[HH:MM:SS]` előtaggal), az eredmény JSON a stdout-ra:
